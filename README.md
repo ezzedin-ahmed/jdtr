@@ -20,7 +20,7 @@ A lightweight, persistent workflow engine for Python that enables building compl
 
 ```bash
 git clone https://github.com/ezzedin-ahmed/jdtr
-pip install -e <PATH_TO_CLONED_REPO>
+pip install -e ./jdtr
 ```
 
 ## Quick Start
@@ -28,11 +28,11 @@ pip install -e <PATH_TO_CLONED_REPO>
 ```python
 from jdtr import Workflow, Database
 
-# Define workflow steps
+# Define workflow steps. Each step's output feeds the next step's input.
 async def validate_order(order_id: str, amount: float) -> tuple[str, float]:
     if amount <= 0:
         raise ValueError("Invalid amount")
-    return (input.order_id, amount)
+    return (order_id, amount)
 
 async def process_payment(order_id: str, amount: float) -> str:
     # Simulate payment processing
@@ -46,10 +46,10 @@ db = Database("./workflow_data")
 workflow = Workflow(
     workflow_id="order_processing",
     steps=[validate_order, process_payment, send_confirmation],
-    db=db
+    db=db,
 )
 
-# Initialize and run
+# Resume any runs left unfinished by a previous crash, then start a new run.
 await workflow.initialize()
 await workflow.run("123", 99.99)
 ```
@@ -149,9 +149,17 @@ async def risky_step(data: str) -> str:
         raise ValueError("Empty data")
     return data.upper()
 
-# If risky_step fails, the run stops and logs the error
-# Progress is saved at the last successful step
-# Next initialization will retry from the failed step
+# If risky_step fails, the run stops and logs the error.
+# Progress is saved at the last successful step.
+# Calling initialize() again retries from the failed step.
+```
+
+A run that keeps failing is retried at most `max_retries` times (default `3`)
+before being marked permanently **failed** and skipped by future
+`initialize()` calls, so a poison run can't loop forever:
+
+```python
+workflow = Workflow("orders", steps, db, max_retries=5)
 ```
 
 ### Multiple Workflows
@@ -177,12 +185,15 @@ Access run state directly:
 ```python
 from jdtr import Run
 
-# Get all unfinished runs
-unfinished = Run.get_unfinished(db)
+# Get all unfinished runs for a specific workflow
+unfinished = Run.get_unfinished(db, workflow_id="order_processing")
 
 for run in unfinished:
     progress = run.get_progress()
-    print(f"Run {run._id} at step {progress}")
+    print(f"Run at step {progress}, attempts={run.get_attempts()}")
+
+# Omit workflow_id to inspect unfinished runs across every workflow
+all_unfinished = Run.get_unfinished(db)
 ```
 
 ## Examples
@@ -211,8 +222,8 @@ await pipeline.run("data.csv")
 ```python
 async def fetch_user(user_id: str, message: str) -> tuple[str, str, str]:
     # Get from database
-    email = f"user{input.user_id}@example.com"
-    return (input.user_id, email, input.message)
+    email = f"user{user_id}@example.com"
+    return (user_id, email, message)
 
 async def send_email(user_id: str, email: str, message: str) -> str:
     # Send via SMTP
@@ -252,11 +263,38 @@ notifier = Workflow("notifications", [fetch_user, send_email, log_notification],
 - pydantic
 - fastapi (optional, for HTTP endpoints)
 
+## Execution Semantics
+
+- **At-least-once, not exactly-once.** After a crash a run resumes from the
+  last *persisted* step, so a step interrupted mid-execution runs again. Keep
+  steps **idempotent**, especially those with side effects (payments, emails).
+- **Step outputs must be JSON-serializable** (or pydantic models, which are
+  stored via `model_dump`). On resume, pydantic models are restored as plain
+  `dict`s — re-validate them inside the step if you need typed models.
+- **Single-process locking only.** Resumption is serialized within one process
+  via an in-memory lock. Running two processes against the same database can
+  execute the same run concurrently; run a single instance per database.
+
 ## Limitations
 
 - Steps must be async functions
 - RocksDB is single-process (no distributed execution)
 - No built-in scheduling or cron support
+- Finished-run state is retained (no automatic garbage collection)
+
+## Development
+
+This project uses [uv](https://docs.astral.sh/uv/) for dependency management.
+
+```bash
+uv sync                              # install deps (incl. dev tools)
+uv run pytest                        # run tests with coverage
+uv run ruff check src tests          # lint
+uv run ruff format src tests         # format
+uv run pyright src                   # type-check
+```
+
+CI runs all of the above on Python 3.12 and 3.13 (see `.github/workflows/ci.yml`).
 
 ## Contributing
 

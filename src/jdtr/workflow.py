@@ -4,12 +4,15 @@ import asyncio
 import functools
 import inspect
 import logging
-from collections.abc import Awaitable
+import types
+from collections.abc import Awaitable, Callable
 from typing import (
     Annotated,
     Any,
-    Callable,
+    Union,
     final,
+    get_args,
+    get_origin,
     get_type_hints,
 )
 
@@ -18,15 +21,24 @@ from fastapi.responses import JSONResponse
 
 from jdtr.data import RUN_PROGRESS_NOT_STARTED, Database, Run
 
+logger = logging.getLogger(__name__)
+
+DEFAULT_MAX_RETRIES = 3
+
 
 def _log_callback(task: asyncio.Task[Any]) -> None:
     """Callback to log exceptions from fire-and-forget tasks."""
+    if task.cancelled():
+        return
     exc = task.exception()
     if exc:
-        logging.error(f"Task failed with exception: {exc}", exc_info=exc)
+        logger.error("Task failed with exception: %s", exc, exc_info=exc)
 
 
-def with_body_signature(func, handler=None):
+def with_body_signature(
+    func: Callable[..., Any],
+    handler: Callable[..., Any] | None = None,
+) -> Callable[..., Any]:
     """
     Create a new function whose signature uses FastAPI Body parameters,
     while delegating execution to `handler` (or `func` if handler is None).
@@ -68,19 +80,90 @@ def with_body_signature(func, handler=None):
     new_sig = sig.replace(parameters=new_params, return_annotation=JSONResponse)
 
     # Create wrapper with correct sync/async behavior
+    wrapper: Callable[..., Any]
     if inspect.iscoroutinefunction(handler):
 
-        async def wrapper(*args, **kwargs):
+        async def _async_wrapper(*args: Any, **kwargs: Any) -> Any:
             return await handler(*args, **kwargs)
+
+        wrapper = _async_wrapper
     else:
 
-        def wrapper(*args, **kwargs):
+        def _sync_wrapper(*args: Any, **kwargs: Any) -> Any:
             return handler(*args, **kwargs)
 
+        wrapper = _sync_wrapper
+
     functools.update_wrapper(wrapper, func)
-    wrapper.__signature__ = new_sig
+    wrapper.__signature__ = new_sig  # type: ignore[attr-defined]
 
     return wrapper
+
+
+def _subtype(sub: Any, sup: Any) -> bool:
+    """
+    Best-effort structural compatibility check between two type annotations.
+
+    Handles plain classes, parameterized generics (e.g. ``list[int]``),
+    and unions/Optional. When a type cannot be reasoned about, this errs on
+    the side of compatibility (returns True) to avoid rejecting valid steps.
+    """
+    if sub is Any or sup is Any or sup is object:
+        return True
+
+    # Normalize NoneType annotations.
+    none_t = type(None)
+    if sub is None:
+        sub = none_t
+    if sup is None:
+        sup = none_t
+
+    sub_origin = get_origin(sub)
+    sup_origin = get_origin(sup)
+
+    # Union / Optional handling (both typing.Union and PEP 604 `X | Y`):
+    # every member of sub must fit sup; sup as a union is satisfied if any
+    # member matches.
+    unions = (Union, types.UnionType)
+    if sup_origin in unions:
+        return any(_subtype(sub, option) for option in get_args(sup))
+    if sub_origin in unions:
+        return all(_subtype(option, sup) for option in get_args(sub))
+
+    # Parameterized generics: compare origins, then arguments positionally.
+    if sup_origin is not None:
+        if sub_origin is None:
+            # e.g. bare `list` provided where `list[int]` expected.
+            sub_base = sub if isinstance(sub, type) else None
+            sup_base = sup_origin if isinstance(sup_origin, type) else None
+            if sub_base is None or sup_base is None:
+                return True
+            return issubclass(sub_base, sup_base)
+        if not (isinstance(sub_origin, type) and isinstance(sup_origin, type)):
+            return True
+        if not issubclass(sub_origin, sup_origin):
+            return False
+        sub_args, sup_args = get_args(sub), get_args(sup)
+        if not sub_args or not sup_args or len(sub_args) != len(sup_args):
+            return True  # unparameterized on one side; don't over-constrain
+        return all(_subtype(sa, pa) for sa, pa in zip(sub_args, sup_args, strict=True))
+
+    # sup is a plain class; sub should be a subclass of it.
+    if isinstance(sub, type) and isinstance(sup, type):
+        try:
+            return issubclass(sub, sup)
+        except TypeError:
+            return True
+    # sub is a generic (e.g. list[int]) where sup is a plain class.
+    if (
+        sub_origin is not None
+        and isinstance(sub_origin, type)
+        and isinstance(sup, type)
+    ):
+        return issubclass(sub_origin, sup)
+
+    # Unresolvable annotations: don't block the workflow.
+    return True
 
 
 def type_compatible(f: Callable[..., Any], g: Callable[..., Any]) -> bool:
@@ -103,45 +186,24 @@ def type_compatible(f: Callable[..., Any], g: Callable[..., Any]) -> bool:
     if not g_types:
         return f_return is type(None) or f_return is None or f_return is Any
 
-    # Check if f returns a tuple
-    if getattr(f_return, "__origin__", None) is tuple:
-        f_types = getattr(f_return, "__args__", ())
+    # Check if f returns a tuple that fans out into multiple parameters.
+    if get_origin(f_return) is tuple:
+        f_types = get_args(f_return)
 
-        # Number of return values must match number of parameters
-        if len(f_types) != len(g_types):
-            return False
-
-        # Check each return type against corresponding parameter type
-        for ft, gt in zip(f_types, g_types):
-            # If either is Any, consider it compatible
-            if ft is Any or gt is Any:
-                continue
-            # Both must be types and ft must be subclass of gt
-            if not (
-                isinstance(ft, type) and isinstance(gt, type) and issubclass(ft, gt)
-            ):
+        # A tuple return maps to multiple params only when g takes >1 param;
+        # otherwise treat the tuple as a single value passed through.
+        if len(g_types) > 1:
+            if len(f_types) != len(g_types):
                 return False
-        return True
+            return all(
+                _subtype(ft, gt) for ft, gt in zip(f_types, g_types, strict=True)
+            )
 
     # Single return value case
     if len(g_types) != 1:
         return False
 
-    gt = g_types[0]
-
-    # If either is Any, consider compatible
-    if f_return is Any or gt is Any:
-        return True
-
-    # Both must be types and f_return must be subclass of gt
-    if isinstance(f_return, type) and isinstance(gt, type):
-        try:
-            return issubclass(f_return, gt)
-        except TypeError:
-            # issubclass can raise TypeError for some generic types
-            return False
-
-    return False
+    return _subtype(f_return, g_types[0])
 
 
 type Step = Callable[..., Awaitable[Any]]
@@ -162,6 +224,7 @@ class Workflow:
         workflow_id: str,
         steps: list[Step],
         db: Database,
+        max_retries: int = DEFAULT_MAX_RETRIES,
     ) -> None:
         """
         Initialize a workflow.
@@ -170,13 +233,20 @@ class Workflow:
             workflow_id: Unique identifier for this workflow
             steps: List of async functions to execute in sequence
             db: Database for persisting workflow state
+            max_retries: Number of times a run may be resumed after a failure
+                before it is marked permanently failed. Guards against poison
+                runs that would otherwise retry forever.
 
         Raises:
             TypeError: If step types are incompatible
+            ValueError: If steps is empty
         """
+        if not steps:
+            raise ValueError("A workflow must have at least one step")
         self._steps: list[Step] = steps
         self._workflow_id = workflow_id
         self._db = db
+        self._max_retries = max_retries
         self._check_types()
         self._resume_lock = asyncio.Lock()
 
@@ -187,18 +257,32 @@ class Workflow:
         This must be called after __init__ to start background resume tasks.
         Call this method once after creating the workflow.
         """
-        unfinished = Run.get_unfinished(self._db)
+        unfinished = Run.get_unfinished(self._db, workflow_id=self._workflow_id)
         for run in unfinished:
             # Create background task for each unfinished run
             task = asyncio.create_task(self._resume_with_lock(run))
             task.add_done_callback(_log_callback)
 
     async def _resume_with_lock(self, run: Run) -> None:
-        """Resume a run with locking to prevent race conditions."""
+        """Resume a run with locking to prevent concurrent resumes in-process."""
         async with self._resume_lock:
-            # Check if still unfinished (another instance might have completed it)
-            if not run.is_finished():
+            # Re-read state: another task/instance may have advanced it.
+            if run.is_finished() or run.is_failed():
+                return
+            attempts = run.increment_attempts()
+            try:
                 await self._resume(run)
+            except Exception:
+                if attempts > self._max_retries:
+                    logger.error(
+                        "Run %s of workflow %s exhausted %d retries; marking as failed",
+                        run._id,
+                        self._workflow_id,
+                        self._max_retries,
+                    )
+                    run.set_failed()
+                # Exception already logged in _run_steps; swallow so one poison
+                # run does not take down the resume loop.
 
     async def _resume(self, run: Run) -> None:
         """
@@ -211,24 +295,22 @@ class Workflow:
 
         if last_done_step == RUN_PROGRESS_NOT_STARTED:
             # Run never started, get initial input
-            input_value = run.get_input()
-            input_list = input_value._inner
+            input_list = run.get_input().inner
             await self._run_steps(input_list, run, start_from=0)
         else:
             # Resume from next step after last completed
-            input_value = run.get_step_output(last_done_step)
-            input_list = input_value._inner
+            input_list = run.get_step_output(last_done_step).inner
             await self._run_steps(input_list, run, start_from=last_done_step + 1)
 
-    async def run(self, *args) -> None:
+    async def run(self, *args: Any) -> None:
         """
         Start a new workflow run with the given input.
 
         Args:
-            input: Input data conforming to workflow's input type
+            *args: Input values for the workflow's first step.
         """
         input = list(args)
-        run_state = Run.new(input, self._db)
+        run_state = Run.new(input, self._db, self._workflow_id)
         await self._run_steps(input, run_state, start_from=0)
 
     async def _run_steps(
@@ -273,11 +355,14 @@ class Workflow:
 
         except Exception as e:
             # Log the error and re-raise
-            logging.error(
-                f"Workflow {self._workflow_id} failed at step {start_from + i}: {e}",
+            logger.error(
+                "Workflow %s failed at step %d: %s",
+                self._workflow_id,
+                start_from + i,
+                e,
                 exc_info=e,
             )
-            # Note: Run is left in unfinished state with progress at last successful step
+            # Run is left unfinished, with progress at the last successful step.
             raise
 
     def _check_types(self) -> None:

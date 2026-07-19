@@ -7,6 +7,7 @@ from unittest.mock import patch
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from pydantic import BaseModel
 
 from jdtr import (
     RUN_INPUT_CF,
@@ -131,7 +132,7 @@ class TestDatabase:
 
 class TestRun:
     def test_run_new(self, db):
-        run = Run.new([1, 2, 3], db)
+        run = Run.new([1, 2, 3], db, "test")
         assert run._id is not None
         assert len(run._id) > 0
 
@@ -140,12 +141,12 @@ class TestRun:
         assert input_val._inner == [1, 2, 3]
 
     def test_run_initial_progress(self, db):
-        run = Run.new([1], db)
+        run = Run.new([1], db, "test")
         assert run.get_progress() == RUN_PROGRESS_NOT_STARTED
         assert not run.is_finished()
 
     def test_run_set_progress(self, db):
-        run = Run.new([1], db)
+        run = Run.new([1], db, "test")
         run.set_progress(0, ["step0_output"])
 
         assert run.get_progress() == 0
@@ -153,14 +154,14 @@ class TestRun:
         assert output._inner == ["step0_output"]
 
     def test_run_set_finished(self, db):
-        run = Run.new([1], db)
+        run = Run.new([1], db, "test")
         run.set_finished()
 
         assert run.is_finished()
         assert run.get_progress() == RUN_PROGRESS_FINISHED
 
     def test_run_multiple_steps(self, db):
-        run = Run.new([1], db)
+        run = Run.new([1], db, "test")
 
         run.set_progress(0, ["output0"])
         run.set_progress(1, ["output1"])
@@ -176,7 +177,7 @@ class TestRun:
         assert runs == []
 
     def test_get_unfinished_single(self, db):
-        run = Run.new([1], db)
+        run = Run.new([1], db, "test")
         run.set_progress(0, ["output"])
 
         unfinished = Run.get_unfinished(db)
@@ -184,8 +185,8 @@ class TestRun:
         assert unfinished[0]._id == run._id
 
     def test_get_unfinished_excludes_finished(self, db):
-        run1 = Run.new([1], db)
-        run2 = Run.new([2], db)
+        run1 = Run.new([1], db, "test")
+        run2 = Run.new([2], db, "test")
 
         run1.set_finished()
         run2.set_progress(0, ["output"])
@@ -195,9 +196,9 @@ class TestRun:
         assert unfinished[0]._id == run2._id
 
     def test_get_unfinished_multiple(self, db):
-        run1 = Run.new([1], db)
-        run2 = Run.new([2], db)
-        run3 = Run.new([3], db)
+        run1 = Run.new([1], db, "test")
+        run2 = Run.new([2], db, "test")
+        run3 = Run.new([3], db, "test")
 
         run1.set_progress(0, ["out1"])
         run2.set_progress(1, ["out2"])
@@ -342,7 +343,7 @@ class TestWorkflow:
             pass
 
         with pytest.raises(TypeError, match="Incompatible types"):
-            workflow = Workflow("test", [step1, step2], db)
+            Workflow("test", [step1, step2], db)
 
     async def test_workflow_type_check(self, db):
         async def step1() -> int:
@@ -355,7 +356,7 @@ class TestWorkflow:
             pass
 
         with pytest.raises(TypeError):
-            workflow = Workflow("test", [step1, step2, step3], db)
+            Workflow("test", [step1, step2, step3], db)
 
     async def test_workflow_resume_unfinished(self, db):
         step2_called = False
@@ -369,7 +370,7 @@ class TestWorkflow:
             return f"Result: {x}"
 
         # Create a run that's partially complete
-        run = Run.new([5, "test"], db)
+        run = Run.new([5, "test"], db, "test")
         run.set_progress(0, [10])  # step1 completed
 
         # Create workflow - should resume the unfinished run
@@ -395,7 +396,7 @@ class TestWorkflow:
             return x * 3
 
         # Create partially complete run
-        run = Run.new([5], db)
+        run = Run.new([5], db, "test")
         run.set_progress(0, [5])
         run.set_progress(1, [10])
 
@@ -439,22 +440,25 @@ class TestWorkflow:
         runs = Run.get_unfinished(db)
         assert len(runs) > 0  # Run not properly cleaned up
 
-    async def test_workflow_race_condition(self, db):
-        async def step1(input) -> int:
+    async def test_single_instance_serializes_resume(self, db):
+        # A single Workflow instance uses one lock, so a run is resumed
+        # exactly once even if initialize() is called repeatedly.
+        executions = 0
+
+        async def step1(value: int) -> int:
+            nonlocal executions
+            executions += 1
             await asyncio.sleep(0.01)
-            return input["value"]
+            return value
 
-        # Create unfinished run
-        run = Run.new([5], db)
-        run.set_progress(RUN_PROGRESS_NOT_STARTED, [])
+        Run.new([5], db, "test")
 
-        # Create two workflow instances
-        workflow1 = Workflow("test", [step1], db)
-        workflow2 = Workflow("test", [step1], db)
-
+        workflow = Workflow("test", [step1], db)
+        await asyncio.gather(workflow.initialize(), workflow.initialize())
         await asyncio.sleep(0.1)
 
-        # TODO: test both not process same run
+        assert executions == 1
+        assert Run.get_unfinished(db, workflow_id="test") == []
 
 
 # ============================================================================
@@ -530,9 +534,9 @@ class TestWorkflowRouter:
         app = FastAPI()
         app.include_router(router)
 
-        with patch("logging.error") as mock_log:
+        with patch("jdtr.workflow.logger.error") as mock_log:
             client = TestClient(app)
-            response = client.post("/test/", json={"value": 5})
+            client.post("/test/", json={"value": 5})
 
             await asyncio.sleep(0.1)
 
@@ -581,7 +585,7 @@ class TestIntegration:
 
         # First session: create workflow and partially execute
         db1 = Database(temp_db_path)
-        run = Run.new([5], db1)
+        run = Run.new([5], db1, "test")
         run.set_progress(0, [50])
 
         # Close database (simulate restart)
@@ -649,3 +653,170 @@ async def test_workflow_varying_length(db, num_steps):
 
     runs = Run.get_unfinished(db)
     assert len(runs) == 0
+
+
+# ============================================================================
+# Regression Tests (production-readiness audit)
+# ============================================================================
+
+
+class TestGenericTypeCompatibility:
+    def test_generic_list_passthrough(self):
+        async def load() -> list[dict]:
+            return [{"a": 1}]
+
+        async def transform(data: list[dict]) -> list[dict]:
+            return data
+
+        assert type_compatible(load, transform)
+
+    def test_generic_dict_param(self):
+        async def produce() -> dict[str, int]:
+            return {}
+
+        async def consume(m: dict[str, int]) -> None:
+            pass
+
+        assert type_compatible(produce, consume)
+
+    def test_generic_element_mismatch(self):
+        async def produce() -> tuple[list[int], str]:
+            return ([1], "x")
+
+        async def consume(a: list[str], b: str) -> None:
+            pass
+
+        assert not type_compatible(produce, consume)
+
+    def test_optional_param_accepts_concrete(self):
+
+        async def produce() -> int:
+            return 1
+
+        async def consume(x: int | None) -> None:
+            pass
+
+        assert type_compatible(produce, consume)
+
+    def test_tuple_passthrough_to_single_tuple_param(self):
+        # A tuple return feeding a single tuple-typed param should be allowed.
+        async def produce() -> tuple[int, str]:
+            return (1, "a")
+
+        async def consume(pair: tuple[int, str]) -> None:
+            pass
+
+        assert type_compatible(produce, consume)
+
+
+@pytest.mark.asyncio
+class TestWorkflowIsolation:
+    async def test_workflow_does_not_resume_other_workflows_runs(self, db):
+        wf1_ran = False
+
+        async def wf1_step(x: int) -> int:
+            nonlocal wf1_ran
+            wf1_ran = True
+            return x + 1
+
+        async def wf2_step(y: str) -> str:
+            return y.upper()
+
+        # An unfinished run belonging to workflow "wf2".
+        Run.new(["hello"], db, "wf2")
+
+        wf1 = Workflow("wf1", [wf1_step], db)
+        await wf1.initialize()
+        await asyncio.sleep(0.1)
+
+        # wf1 must not touch wf2's run.
+        assert not wf1_ran
+        unfinished_wf2 = Run.get_unfinished(db, workflow_id="wf2")
+        assert len(unfinished_wf2) == 1
+
+    async def test_workflow_resumes_only_own_runs(self, db):
+        ran = False
+
+        async def step(x: int) -> int:
+            nonlocal ran
+            ran = True
+            return x + 1
+
+        Run.new([5], db, "mine")
+        wf = Workflow("mine", [step], db)
+        await wf.initialize()
+        await asyncio.sleep(0.1)
+
+        assert ran
+        assert Run.get_unfinished(db, workflow_id="mine") == []
+
+
+@pytest.mark.asyncio
+class TestPoisonRunRetryCap:
+    async def test_run_marked_failed_after_max_retries(self, db):
+        attempts = 0
+
+        async def always_fails(x: int) -> int:
+            nonlocal attempts
+            attempts += 1
+            raise ValueError("boom")
+
+        Run.new([1], db, "poison")
+        wf = Workflow("poison", [always_fails], db, max_retries=2)
+
+        # Each initialize() triggers one resume attempt.
+        for _ in range(5):
+            await wf.initialize()
+            await asyncio.sleep(0.05)
+
+        # Retries are capped: attempt 1, 2, 3 (=max_retries+1) then failed.
+        assert attempts == 3
+        assert Run.get_unfinished(db, workflow_id="poison") == []
+        [run] = [Run(rid, db) for rid in db.get_all_ids("runprogress")]
+        assert run.is_failed()
+
+
+class TestSerializationHardening:
+    def test_pydantic_model_roundtrips_all_positions(self):
+        class M(BaseModel):
+            x: int
+
+        # Model in a non-zero position must serialize (old code only handled [0]).
+        val = Value([1, M(x=7)])
+        restored = Value.from_str(val.to_str())
+        assert restored.inner == [1, {"x": 7}]
+
+    def test_multiple_models_serialize(self):
+        class M(BaseModel):
+            x: int
+
+        val = Value([M(x=1), M(x=2)])
+        assert Value.from_str(val.to_str()).inner == [{"x": 1}, {"x": 2}]
+
+    def test_non_serializable_raises_typeerror(self):
+        val = Value([object()])
+        with pytest.raises(TypeError):
+            val.to_str()
+
+    def test_corrupt_value_raises_valueerror(self, db):
+        key = Key(column_family=RUN_INPUT_CF, record_id="corrupt")
+        cf = db._db.get_column_family(RUN_INPUT_CF)
+        cf[key.record_id] = "{not valid json"
+        with pytest.raises(ValueError):
+            db.get(key)
+
+
+@pytest.mark.asyncio
+class TestWorkflowValidation:
+    async def test_empty_steps_rejected(self, db):
+        with pytest.raises(ValueError):
+            Workflow("empty", [], db)
+
+
+class TestDatabaseContextManager:
+    def test_context_manager_closes(self, temp_db_path):
+        with Database(temp_db_path) as db:
+            db.set(Key(column_family=RUN_INPUT_CF, record_id="k"), Value([1]))
+        # Reopen to confirm data persisted and db was closed cleanly.
+        with Database(temp_db_path) as db2:
+            assert db2.get(Key(column_family=RUN_INPUT_CF, record_id="k")).inner == [1]
